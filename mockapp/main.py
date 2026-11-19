@@ -2,10 +2,9 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import hashlib
-import json
 from fastapi import FastAPI, Request, Response
 from visaqueue.config import SPEC
-from visaqueue.mockdata import build_rows, extra_row
+from visaqueue.mockdata import build_rows, extra_row, page_policy, reset_scene, scene, set_scene
 
 app = FastAPI(title="Local source")
 _ALL = build_rows()
@@ -22,7 +21,17 @@ def _page_items(page):
 
 @app.get("/items")
 def items(page: int = 1):
-    data = _page_items(page)
+    policy = page_policy(page)
+    if policy == "fail":
+        return Response(status_code=500)
+    if policy == "drop":
+        # Simulate a truncated archive: return an empty page so the client
+        # sees an early end, while later pages still exist on the server.
+        data = []
+    elif policy == "repeat":
+        data = list(_page_items(max(1, page - 1)))
+    else:
+        data = _page_items(page)
     if SPEC.fmt == "json":
         return {"items": data, "page": page}
     if SPEC.fmt == "text":
@@ -50,6 +59,22 @@ def probe():
 def health():
     return {"ok": True, "rows": len(_data())}
 
+@app.post("/scene")
+async def configure_scene(request: Request):
+    body = await request.json()
+    return {"scene": set_scene(**body)}
+
+@app.post("/scene/reset")
+def reset():
+    _extra.clear()
+    return {"scene": reset_scene()}
+
+@app.get("/scene")
+def get_scene():
+    return {"scene": {k: sorted(v) if isinstance(v, set) else v
+                      for k, v in scene().items()},
+            "rows": len(_data())}
+
 @app.post("/login")
 def login(response: Response):
     sid = "SID-local"
@@ -66,7 +91,10 @@ def query(request: Request, page: int = 1):
         return Response(status_code=401)
     if request.headers.get("x-csrf") != request.cookies.get("csrf"):
         return Response(status_code=403)
-    items_page = _page_items(page)
+    policy = page_policy(page)
+    if policy == "fail":
+        return Response(status_code=500)
+    items_page = [] if policy == "drop" else _page_items(page)
     nxt = _page_items(page + 1)
     sid = request.cookies.get("sid")
     gate = (SPEC.engine == "rpa" and page == 1 and sid not in _verified_sessions
